@@ -58,10 +58,13 @@ ORDERS_PATH = os.path.join(BASE_DIR, "smm_orders.json")
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")
 USERS_PATH = os.path.join(BASE_DIR, "users.json")
 PROMOCODES_PATH = os.path.join(BASE_DIR, "promocodes.json")
+TOPUPS_PATH = os.path.join(BASE_DIR, "topups.json")
 
 SHOP_NAME = "Dzhant Shop"
 TWIBOOST_API_URL = "https://twiboost.com/api/v2"
+CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 ORDER_CHECK_INTERVAL = 180  # сек, как часто проверять статусы активных заказов
+TOPUP_CHECK_INTERVAL = 20  # сек, как часто проверять неоплаченные счета CryptoBot
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dzhant_shop")
@@ -259,6 +262,43 @@ def redeem_promocode(code: str, user_id: int):
 
 
 # ─────────────────────────────────────────────
+#  ПОПОЛНЕНИЯ БАЛАНСА (CryptoBot)
+# ─────────────────────────────────────────────
+def load_topups() -> dict:
+    return _load_json(TOPUPS_PATH, {})
+
+
+def save_topups(data: dict) -> None:
+    _save_json(TOPUPS_PATH, data)
+
+
+def create_topup(invoice_id: str, user_id: int, amount: float) -> None:
+    topups = load_topups()
+    topups[str(invoice_id)] = {
+        "user_id": user_id,
+        "amount": amount,
+        "status": "active",
+        "created_at": int(time.time()),
+    }
+    save_topups(topups)
+
+
+def mark_topup_paid(invoice_id: str) -> bool:
+    """Помечает счёт оплаченным и начисляет баланс. Возвращает True при первом
+    успешном зачислении (защита от повторного начисления)."""
+    topups = load_topups()
+    entry = topups.get(str(invoice_id))
+    if not entry or entry.get("status") == "paid":
+        return False
+    entry["status"] = "paid"
+    entry["paid_at"] = int(time.time())
+    topups[str(invoice_id)] = entry
+    save_topups(topups)
+    add_balance(entry["user_id"], float(entry["amount"]))
+    return True
+
+
+# ─────────────────────────────────────────────
 #  TWIBOOST API
 # ─────────────────────────────────────────────
 class TwiBoostApi:
@@ -302,6 +342,58 @@ class TwiBoostApi:
 
 
 # ─────────────────────────────────────────────
+#  CRYPTOBOT API (Crypto Pay) — пополнение баланса
+#  Документация: https://help.crypt.bot/crypto-pay-api
+# ─────────────────────────────────────────────
+class CryptoBotApi:
+    @staticmethod
+    def _request(token: str, method: str, params: dict | None = None):
+        headers = {"Crypto-Pay-API-Token": token}
+        try:
+            r = requests.post(f"{CRYPTOBOT_API_URL}/{method}", headers=headers, json=params or {}, timeout=20)
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result")
+            logger.warning(f"CryptoBot API error [{method}]: {data.get('error')}")
+            return None
+        except Exception as ex:
+            logger.error(f"CryptoBot API request failed [{method}]: {ex}")
+            return None
+
+    @staticmethod
+    def check_token(token: str):
+        """Проверка токена — возвращает данные приложения CryptoBot или None."""
+        return CryptoBotApi._request(token, "getMe")
+
+    @staticmethod
+    def create_invoice(token: str, amount: float, payload: str, description: str = ""):
+        params = {
+            "currency_type": "fiat",
+            "fiat": "RUB",
+            "amount": f"{amount:.2f}",
+            "description": description or "Пополнение баланса",
+            "payload": payload,
+            "expires_in": 3600,
+        }
+        return CryptoBotApi._request(token, "createInvoice", params)
+
+    @staticmethod
+    def get_invoice(token: str, invoice_id):
+        result = CryptoBotApi._request(token, "getInvoices", {"invoice_ids": str(invoice_id)})
+        if isinstance(result, dict):
+            items = result.get("items", [])
+            return items[0] if items else None
+        return None
+
+    @staticmethod
+    def get_active_invoices(token: str):
+        result = CryptoBotApi._request(token, "getInvoices", {"status": "active"})
+        if isinstance(result, dict):
+            return result.get("items", [])
+        return []
+
+
+# ─────────────────────────────────────────────
 #  FSM СОСТОЯНИЯ
 # ─────────────────────────────────────────────
 class AdminAuth(StatesGroup):
@@ -318,6 +410,7 @@ class AdminFlow(StatesGroup):
     waiting_promo_custom_code = State()
     waiting_promo_amount = State()
     waiting_promo_activations = State()
+    waiting_cryptobot_token = State()
 
 
 class OrderFlow(StatesGroup):
@@ -327,17 +420,22 @@ class OrderFlow(StatesGroup):
 
 class ProfileFlow(StatesGroup):
     waiting_promo_code = State()
+    waiting_topup_amount = State()
 
 
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ (инлайн)
 # ─────────────────────────────────────────────
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="🛠 Услуги", callback_data="menu_uslugi")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="ℹ️ О магазине", callback_data="menu_about")],
     ]
+    if user_id is not None:
+        cfg = load_config()
+        if user_id in cfg.get("admin_ids", []):
+            kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adm_open_from_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -389,25 +487,55 @@ def back_kb(callback_data="back_main", text="⬅️ Назад") -> InlineKeyboa
 def admin_panel_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-        [InlineKeyboardButton(text="🚀 SMM", callback_data="adm_smm")],
+        [InlineKeyboardButton(text="🚀 Услуги", callback_data="adm_uslugi")],
         [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_addpromo")],
         [InlineKeyboardButton(text="🎫 Активные промокоды", callback_data="adm_active_promos")],
+        [InlineKeyboardButton(text="💳 Способы оплаты", callback_data="adm_payments")],
         [InlineKeyboardButton(text="⚙️ Конфиг", callback_data="adm_config")],
         [InlineKeyboardButton(text="🚪 Выход", callback_data="adm_exit")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def admin_smm_kb() -> InlineKeyboardMarkup:
+def admin_payments_kb() -> InlineKeyboardMarkup:
+    cfg = load_config()
+    has_token = bool(cfg.get("cryptobot_token"))
+    enabled = cfg.get("cryptobot_enabled", False)
+    token_status = "✅ подключён" if has_token else "❌ не подключён"
+    toggle_text = "🔴 Выключить CryptoBot" if enabled else "🟢 Включить CryptoBot"
+    kb = [
+        [InlineKeyboardButton(text=f"🔑 CryptoBot API ({token_status})", callback_data="adm_cryptobot_setkey")],
+    ]
+    if has_token:
+        kb.append([InlineKeyboardButton(text=toggle_text, callback_data="adm_cryptobot_toggle")])
+    kb.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def admin_uslugi_kb() -> InlineKeyboardMarkup:
     cfg = load_config()
     key_status = "✅ подключён" if cfg.get("twiboost_api_key") else "❌ не подключён"
     kb = [
         [InlineKeyboardButton(text=f"🔑 TwiBoost API ({key_status})", callback_data="adm_setkey")],
+        [InlineKeyboardButton(text="🗂 Сервисы", callback_data="adm_categories")],
         [InlineKeyboardButton(text="📦 Лоты", callback_data="adm_services")],
         [InlineKeyboardButton(text="🧾 Заказы", callback_data="adm_orders")],
         [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm_back")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def admin_categories_kb() -> InlineKeyboardMarkup:
+    categories = load_categories()
+    rows = []
+    for cat in categories:
+        rows.append([
+            InlineKeyboardButton(text=cat, callback_data="noop"),
+            InlineKeyboardButton(text="🗑", callback_data=f"adm_delcat_{cat}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Добавить сервис", callback_data="adm_addcat_direct")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в Услуги", callback_data="adm_uslugi")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_config_kb() -> InlineKeyboardMarkup:
@@ -440,7 +568,7 @@ def admin_services_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑", callback_data=f"adm_delsvc_{svc_id}"),
         ])
     rows.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm_addsvc")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в SMM", callback_data="adm_smm")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в Услуги", callback_data="adm_uslugi")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -453,7 +581,7 @@ async def cmd_start(message: Message):
     await message.answer(
         f"Добро пожаловать в <b>{SHOP_NAME}</b>! 🛒\n\n"
         "Это тестовая версия магазина. Выберите раздел ниже 👇",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
         parse_mode="HTML",
     )
 
@@ -463,7 +591,7 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text(
         f"<b>{SHOP_NAME}</b> — главное меню:",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(call.from_user.id),
         parse_mode="HTML",
     )
     await call.answer()
@@ -473,10 +601,13 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext):
 async def cb_profile(call: CallbackQuery):
     user = call.from_user
     balance = get_balance(user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎟 Промокод", callback_data="profile_promo")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
-    ])
+    cfg = load_config()
+    rows = []
+    if cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled"):
+        rows.append([InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="profile_topup")])
+    rows.append([InlineKeyboardButton(text="🎟 Промокод", callback_data="profile_promo")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await call.message.edit_text(
         "👤 <b>Ваш профиль</b>\n"
         f"ID: <code>{user.id}</code>\n"
@@ -522,12 +653,107 @@ async def profile_get_promo_code(message: Message, state: FSMContext):
     )
 
 
+@router.callback_query(F.data == "profile_topup")
+async def cb_profile_topup(call: CallbackQuery, state: FSMContext):
+    cfg = load_config()
+    if not (cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled")):
+        await call.answer("Пополнение баланса временно недоступно.", show_alert=True)
+        return
+    await state.set_state(ProfileFlow.waiting_topup_amount)
+    await call.message.edit_text(
+        "💰 <b>Пополнение баланса</b>\n\nВведите сумму пополнения в рублях (например 500):",
+        reply_markup=back_kb("menu_profile", "❌ Отмена"),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(ProfileFlow.waiting_topup_amount)
+async def profile_get_topup_amount(message: Message, state: FSMContext):
+    try:
+        amount = float((message.text or "").replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно положительное число, например 500. Введите сумму:")
+        return
+
+    await state.clear()
+    cfg = load_config()
+    token = cfg.get("cryptobot_token")
+    if not (token and cfg.get("cryptobot_enabled")):
+        await message.answer("Пополнение баланса временно недоступно.", reply_markup=back_kb("menu_profile"))
+        return
+
+    wait_msg = await message.answer("⏳ Создаю счёт на оплату...")
+    payload = f"topup:{message.from_user.id}:{int(time.time())}"
+    invoice = CryptoBotApi.create_invoice(token, amount, payload, f"Пополнение баланса {SHOP_NAME}")
+    await wait_msg.delete()
+
+    if not invoice or "invoice_id" not in invoice:
+        await message.answer(
+            "❌ Не удалось создать счёт. Попробуйте позже.",
+            reply_markup=back_kb("menu_profile"),
+        )
+        return
+
+    create_topup(invoice["invoice_id"], message.from_user.id, amount)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", url=invoice["pay_url"])],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"topup_check_{invoice['invoice_id']}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_profile")],
+    ])
+    await message.answer(
+        f"💰 <b>Счёт создан</b>\n\n"
+        f"Сумма: <b>{amount} ₽</b>\n\n"
+        "Нажмите «Оплатить», чтобы перейти к оплате в CryptoBot. "
+        "После оплаты баланс пополнится автоматически — можно также нажать «Проверить оплату».",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("topup_check_"))
+async def cb_topup_check(call: CallbackQuery):
+    invoice_id = call.data.removeprefix("topup_check_")
+    cfg = load_config()
+    token = cfg.get("cryptobot_token")
+    if not token:
+        await call.answer("Оплата недоступна.", show_alert=True)
+        return
+
+    invoice = CryptoBotApi.get_invoice(token, invoice_id)
+    if not invoice:
+        await call.answer("Не удалось проверить статус. Попробуйте позже.", show_alert=True)
+        return
+
+    if invoice.get("status") == "paid":
+        credited = mark_topup_paid(invoice_id)
+        balance = get_balance(call.from_user.id)
+        if credited:
+            await call.message.edit_text(
+                f"✅ Оплата получена! Баланс пополнен.\n💰 Текущий баланс: <b>{balance} ₽</b>",
+                reply_markup=back_kb("menu_profile"),
+                parse_mode="HTML",
+            )
+        else:
+            await call.message.edit_text(
+                f"✅ Этот счёт уже был зачислен ранее.\n💰 Текущий баланс: <b>{balance} ₽</b>",
+                reply_markup=back_kb("menu_profile"),
+                parse_mode="HTML",
+            )
+        await call.answer()
+    else:
+        await call.answer("Оплата ещё не поступила. Попробуйте немного позже.", show_alert=True)
+
+
 @router.callback_query(F.data == "menu_about")
 async def cb_about(call: CallbackQuery):
     await call.message.edit_text(
         f"ℹ️ <b>{SHOP_NAME}</b>\n\n"
         "Тестовая версия магазина в Telegram.\n"
-        "Есть раздел «Накрутка» (SMM) — заказ выполняется автоматически через TwiBoost.",
+        "Есть раздел «Накрутка» — заказ выполняется автоматически через TwiBoost.",
         reply_markup=back_kb(),
         parse_mode="HTML",
     )
@@ -535,7 +761,7 @@ async def cb_about(call: CallbackQuery):
 
 
 # ─────────────────────────────────────────────
-#  SMM / НАКРУТКА (покупатель)
+#  УСЛУГИ / НАКРУТКА (покупатель)
 # ─────────────────────────────────────────────
 @router.callback_query(F.data == "menu_uslugi")
 async def cb_menu_uslugi(call: CallbackQuery):
@@ -630,7 +856,7 @@ async def order_get_quantity(message: Message, state: FSMContext):
     svc = services.get(data.get("svc_id"))
     if not svc:
         await state.clear()
-        await message.answer("Услуга больше не доступна.", reply_markup=main_menu_kb())
+        await message.answer("Услуга больше не доступна.", reply_markup=main_menu_kb(message.from_user.id))
         return
 
     if not message.text or not message.text.strip().isdigit():
@@ -659,7 +885,7 @@ async def order_get_link(message: Message, state: FSMContext):
     svc = services.get(data.get("svc_id"))
     if not svc:
         await state.clear()
-        await message.answer("Услуга больше не доступна.", reply_markup=main_menu_kb())
+        await message.answer("Услуга больше не доступна.", reply_markup=main_menu_kb(message.from_user.id))
         return
 
     qty = data["quantity"]
@@ -821,6 +1047,18 @@ async def check_admin_password(message: Message, state: FSMContext):
     await state.clear()
 
 
+@router.callback_query(F.data == "adm_open_from_menu")
+async def cb_adm_open_from_menu(call: CallbackQuery):
+    cfg = load_config()
+    if call.from_user.id not in cfg.get("admin_ids", []):
+        await call.answer("Доступ запрещён.", show_alert=True)
+        return
+    await call.message.edit_text(
+        "🛠 <b>Админ-панель Dzhant Shop</b>", reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data == "adm_back")
 async def cb_adm_back(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -831,7 +1069,11 @@ async def cb_adm_back(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "adm_exit")
 async def cb_adm_exit(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("Панель закрыта.")
+    await call.message.edit_text(
+        f"<b>{SHOP_NAME}</b> — главное меню:",
+        reply_markup=main_menu_kb(call.from_user.id),
+        parse_mode="HTML",
+    )
     await call.answer()
 
 
@@ -843,15 +1085,15 @@ async def cb_adm_stats(call: CallbackQuery):
     await call.message.edit_text(
         "📊 <b>Статистика</b>\n\n"
         f"👥 Всего нажали /start: <b>{total_started}</b>\n"
-        f"🧾 Всего заказов SMM: <b>{len(orders)}</b>",
+        f"🧾 Всего заказов Услуги: <b>{len(orders)}</b>",
         reply_markup=back_kb("adm_back", "⬅️ В админ-панель"),
         parse_mode="HTML",
     )
     await call.answer()
 
 
-@router.callback_query(F.data == "adm_smm")
-async def cb_adm_smm(call: CallbackQuery):
+@router.callback_query(F.data == "adm_uslugi")
+async def cb_adm_uslugi(call: CallbackQuery):
     cfg = load_config()
     key = cfg.get("twiboost_api_key")
     if key:
@@ -864,15 +1106,96 @@ async def cb_adm_smm(call: CallbackQuery):
     services = load_services()
     orders = load_orders()
     await call.message.edit_text(
-        "🚀 <b>SMM</b>\n\n"
+        "🚀 <b>Управление услугами</b>\n\n"
         f"🔑 TwiBoost: {status}\n"
         f"📦 Лотов: <b>{len(services)}</b>\n"
         f"🧾 Заказов: <b>{len(orders)}</b>\n\n"
         "Выберите раздел:",
-        reply_markup=admin_smm_kb(),
+        reply_markup=admin_uslugi_kb(),
         parse_mode="HTML",
     )
     await call.answer()
+
+
+@router.callback_query(F.data == "adm_payments")
+async def cb_adm_payments(call: CallbackQuery):
+    cfg = load_config()
+    has_token = bool(cfg.get("cryptobot_token"))
+    enabled = cfg.get("cryptobot_enabled", False)
+    if has_token and enabled:
+        status = "✅ CryptoBot подключён и включён"
+    elif has_token and not enabled:
+        status = "⏸ CryptoBot подключён, но выключен"
+    else:
+        status = "❌ CryptoBot не подключён"
+    await call.message.edit_text(
+        f"💳 <b>Способы оплаты</b>\n\n{status}\n\n"
+        "CryptoBot — приём оплаты через криптовалюту (@CryptoBot в Telegram). "
+        "Получите API-токен: @CryptoBot → Crypto Pay → Create App.",
+        reply_markup=admin_payments_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_cryptobot_setkey")
+async def cb_adm_cryptobot_setkey(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.waiting_cryptobot_token)
+    await call.message.edit_text(
+        "🔑 <b>CryptoBot API</b>\n\n"
+        "Откройте @CryptoBot в Telegram → Crypto Pay → Create App, "
+        "скопируйте API-токен и пришлите его сюда:",
+        reply_markup=back_kb("adm_payments", "❌ Отмена"),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(AdminFlow.waiting_cryptobot_token)
+async def adm_get_cryptobot_token(message: Message, state: FSMContext):
+    token = (message.text or "").strip()
+    await state.clear()
+
+    wait_msg = await message.answer("⏳ Проверяю токен CryptoBot...")
+    app_info = CryptoBotApi.check_token(token)
+    await wait_msg.delete()
+
+    if app_info is None:
+        await message.answer(
+            "❌ Неверный токен или CryptoBot недоступен. Проверьте токен и попробуйте снова.",
+            reply_markup=admin_payments_kb(),
+        )
+        return
+
+    cfg = load_config()
+    cfg["cryptobot_token"] = token
+    cfg["cryptobot_enabled"] = True
+    save_config(cfg)
+
+    app_name = app_info.get("name", "CryptoBot App")
+    await message.answer(
+        f"✅ CryptoBot подключён и включён!\nПриложение: <b>{app_name}</b>",
+        reply_markup=admin_payments_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "adm_cryptobot_toggle")
+async def cb_adm_cryptobot_toggle(call: CallbackQuery):
+    cfg = load_config()
+    if not cfg.get("cryptobot_token"):
+        await call.answer("Сначала подключите CryptoBot API токен.", show_alert=True)
+        return
+    cfg["cryptobot_enabled"] = not cfg.get("cryptobot_enabled", False)
+    save_config(cfg)
+    enabled = cfg["cryptobot_enabled"]
+    status = "✅ CryptoBot подключён и включён" if enabled else "⏸ CryptoBot подключён, но выключен"
+    await call.message.edit_text(
+        f"💳 <b>Способы оплаты</b>\n\n{status}",
+        reply_markup=admin_payments_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer("Оплата включена" if enabled else "Оплата выключена")
 
 
 @router.callback_query(F.data == "adm_config")
@@ -1027,7 +1350,7 @@ async def cb_adm_setkey(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "🔑 <b>TwiBoost API</b>\n\n"
         "Пришлите API-ключ TwiBoost (личный кабинет twiboost.com → API):",
-        reply_markup=back_kb("adm_smm", "❌ Отмена"),
+        reply_markup=back_kb("adm_uslugi", "❌ Отмена"),
         parse_mode="HTML",
     )
     await call.answer()
@@ -1045,8 +1368,8 @@ async def adm_get_api_key(message: Message, state: FSMContext):
     if balance is None:
         await message.answer(
             "❌ Неверный API-ключ или TwiBoost недоступен.\n"
-            "Проверьте ключ в профиле twiboost.com и попробуйте снова через 🚀 SMM → 🔑 TwiBoost API.",
-            reply_markup=admin_smm_kb(),
+            "Проверьте ключ в профиле twiboost.com и попробуйте снова через 🚀 Услуги → 🔑 TwiBoost API.",
+            reply_markup=admin_uslugi_kb(),
         )
         return
 
@@ -1056,7 +1379,7 @@ async def adm_get_api_key(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ TwiBoost подключён!\nБаланс: <b>{balance[0]} {balance[1]}</b>",
-        reply_markup=admin_smm_kb(),
+        reply_markup=admin_uslugi_kb(),
         parse_mode="HTML",
     )
 
@@ -1064,7 +1387,7 @@ async def adm_get_api_key(message: Message, state: FSMContext):
 @router.callback_query(F.data == "adm_services")
 async def cb_adm_services(call: CallbackQuery):
     await call.message.edit_text(
-        "📦 <b>Лоты SMM</b>\n\nСписок активных предложений:",
+        "📦 <b>Лоты</b>\n\nСписок активных предложений:",
         reply_markup=admin_services_kb(),
         parse_mode="HTML",
     )
@@ -1078,8 +1401,52 @@ async def cb_adm_delsvc(call: CallbackQuery):
     services.pop(svc_id, None)
     save_services(services)
     await call.message.edit_text(
-        "📦 <b>Лоты SMM</b>\n\nЛот удалён.",
+        "📦 <b>Лоты</b>\n\nЛот удалён.",
         reply_markup=admin_services_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_categories")
+async def cb_adm_categories(call: CallbackQuery):
+    await call.message.edit_text(
+        "🗂 <b>Сервисы</b>\n\n"
+        "Это категории для удобной навигации покупателей (Telegram, YouTube и т.д.). "
+        "На работу с TwiBoost они не влияют.",
+        reply_markup=admin_categories_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_addcat_direct")
+async def cb_adm_addcat_direct(call: CallbackQuery, state: FSMContext):
+    await state.update_data(direct=True)
+    await state.set_state(AdminFlow.waiting_new_category_name)
+    await call.message.edit_text(
+        "✏️ Напишите название нового сервиса (например Telegram, YouTube и т.д.):",
+        reply_markup=back_kb("adm_categories", "❌ Отмена"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_delcat_"))
+async def cb_adm_delcat(call: CallbackQuery):
+    category = call.data.removeprefix("adm_delcat_")
+    categories = load_categories()
+    if category in categories:
+        categories.remove(category)
+        save_categories(categories)
+    await call.message.edit_text(
+        "🗂 <b>Сервисы</b>\n\nСервис удалён из списка (лоты, привязанные к нему, остаются, "
+        "но пока не будут показаны в категориях — привяжите их к другому сервису).",
+        reply_markup=admin_categories_kb(),
         parse_mode="HTML",
     )
     await call.answer()
@@ -1092,7 +1459,7 @@ def category_choice_kb() -> InlineKeyboardMarkup:
         for cat in categories
     ]
     rows.append([InlineKeyboardButton(text="➕ Новый сервис", callback_data="adm_cat_new")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в SMM", callback_data="adm_smm")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в Услуги", callback_data="adm_uslugi")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1152,6 +1519,17 @@ async def adm_get_category_name(message: Message, state: FSMContext):
         return
 
     add_category(category)
+    data = await state.get_data()
+
+    if data.get("direct"):
+        # Прямое добавление сервиса из раздела "Сервисы" — не продолжаем в создание лота
+        await state.clear()
+        await message.answer(
+            f"✅ Сервис «{category}» добавлен.",
+            reply_markup=admin_categories_kb(),
+        )
+        return
+
     await state.update_data(category=category)
     await state.set_state(AdminFlow.waiting_new_service_name)
     await message.answer(
@@ -1258,7 +1636,7 @@ async def cb_adm_orders(call: CallbackQuery):
                 f"{o['status']} · @{o.get('username') or o['user_id']}"
             )
         text = "\n".join(lines)
-    await call.message.edit_text(text, reply_markup=back_kb("adm_smm", "⬅️ Назад в SMM"), parse_mode="HTML")
+    await call.message.edit_text(text, reply_markup=back_kb("adm_uslugi", "⬅️ Назад в Услуги"), parse_mode="HTML")
     await call.answer()
 
 
@@ -1299,6 +1677,43 @@ async def order_status_checker(bot: Bot):
         await asyncio.sleep(ORDER_CHECK_INTERVAL)
 
 
+async def topup_checker(bot: Bot):
+    """Фоновая проверка неоплаченных счетов CryptoBot — как только оплата
+    поступила, баланс пользователя пополняется автоматически."""
+    while True:
+        try:
+            cfg = load_config()
+            token = cfg.get("cryptobot_token")
+            if token and cfg.get("cryptobot_enabled"):
+                topups = load_topups()
+                pending_ids = [
+                    invoice_id for invoice_id, entry in topups.items()
+                    if entry.get("status") != "paid"
+                ]
+                for invoice_id in pending_ids:
+                    invoice = CryptoBotApi.get_invoice(token, invoice_id)
+                    if not invoice:
+                        continue
+                    if invoice.get("status") == "paid":
+                        credited = mark_topup_paid(invoice_id)
+                        if credited:
+                            entry = load_topups().get(invoice_id, {})
+                            user_id = entry.get("user_id")
+                            amount = entry.get("amount")
+                            if user_id:
+                                try:
+                                    await bot.send_message(
+                                        user_id,
+                                        f"✅ Баланс пополнен на <b>{amount} ₽</b> (оплата через CryptoBot получена).",
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as ex:
+                                    logger.warning(f"Не удалось уведомить пользователя {user_id}: {ex}")
+        except Exception as ex:
+            logger.error(f"topup_checker error: {ex}")
+        await asyncio.sleep(TOPUP_CHECK_INTERVAL)
+
+
 # ─────────────────────────────────────────────
 #  FALLBACK: НЕРАСПОЗНАННЫЕ СООБЩЕНИЯ И КНОПКИ
 #  Должны быть зарегистрированы ПОСЛЕДНИМИ — иначе перехватят
@@ -1312,7 +1727,7 @@ async def fallback_callback(call: CallbackQuery, state: FSMContext):
     try:
         await call.message.edit_text(
             f"<b>{SHOP_NAME}</b> — главное меню:",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(call.from_user.id),
             parse_mode="HTML",
         )
     except Exception:
@@ -1326,7 +1741,7 @@ async def fallback_message(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Не понял команду 🤔\nНажмите /start, чтобы открыть меню.",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
     )
 
 
@@ -1378,6 +1793,7 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(order_status_checker(bot))
+    asyncio.create_task(topup_checker(bot))
 
     logger.info("Bot started")
     await dp.start_polling(bot)
