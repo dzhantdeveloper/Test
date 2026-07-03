@@ -288,8 +288,7 @@ class ProfileFlow(StatesGroup):
 # ─────────────────────────────────────────────
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton(text="🛍 Товары", callback_data="menu_products")],
-        [InlineKeyboardButton(text="🧾 Лоты", callback_data="menu_services")],
+        [InlineKeyboardButton(text="🚀 SMM", callback_data="menu_services")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="ℹ️ О магазине", callback_data="menu_about")],
     ]
@@ -300,14 +299,6 @@ def back_kb(callback_data="back_main", text="⬅️ Назад") -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=callback_data)]])
 
 
-def products_kb() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(text="🚀 Накрутка (SMM)", callback_data="smm_open")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
 def smm_services_kb() -> InlineKeyboardMarkup:
     services = load_services()
     rows = []
@@ -316,19 +307,29 @@ def smm_services_kb() -> InlineKeyboardMarkup:
             text=f"{svc['name']} — {svc['price']} ₽/шт",
             callback_data=f"svc_{svc_id}",
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_products")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-        [InlineKeyboardButton(text="🔑 TwiBoost API", callback_data="adm_setkey")],
-        [InlineKeyboardButton(text="📦 Лоты SMM", callback_data="adm_services")],
-        [InlineKeyboardButton(text="🧾 Последние заказы", callback_data="adm_orders")],
+        [InlineKeyboardButton(text="🚀 SMM", callback_data="adm_smm")],
         [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_addpromo")],
         [InlineKeyboardButton(text="⚙️ Конфиг", callback_data="adm_config")],
         [InlineKeyboardButton(text="🚪 Выход", callback_data="adm_exit")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def admin_smm_kb() -> InlineKeyboardMarkup:
+    cfg = load_config()
+    key_status = "✅ подключён" if cfg.get("twiboost_api_key") else "❌ не подключён"
+    kb = [
+        [InlineKeyboardButton(text=f"🔑 TwiBoost API ({key_status})", callback_data="adm_setkey")],
+        [InlineKeyboardButton(text="📦 Лоты", callback_data="adm_services")],
+        [InlineKeyboardButton(text="🧾 Заказы", callback_data="adm_orders")],
+        [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm_back")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -362,7 +363,7 @@ def admin_services_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑", callback_data=f"adm_delsvc_{svc_id}"),
         ])
     rows.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm_addsvc")])
-    rows.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm_back")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в SMM", callback_data="adm_smm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -388,12 +389,6 @@ async def cb_back_main(call: CallbackQuery, state: FSMContext):
         reply_markup=main_menu_kb(),
         parse_mode="HTML",
     )
-    await call.answer()
-
-
-@router.callback_query(F.data == "menu_products")
-async def cb_products(call: CallbackQuery):
-    await call.message.edit_text("🛍 <b>Товары</b>\n\nВыберите товар:", reply_markup=products_kb(), parse_mode="HTML")
     await call.answer()
 
 
@@ -472,7 +467,7 @@ async def cb_smm_open(call: CallbackQuery):
         await call.message.edit_text(
             "🧾 <b>Лоты</b>\n\n"
             "Пока нет ни одного активного предложения. Загляните позже.",
-            reply_markup=back_kb("menu_products"),
+            reply_markup=back_kb("back_main"),
             parse_mode="HTML",
         )
     else:
@@ -728,6 +723,31 @@ async def cb_adm_stats(call: CallbackQuery):
     await call.answer()
 
 
+@router.callback_query(F.data == "adm_smm")
+async def cb_adm_smm(call: CallbackQuery):
+    cfg = load_config()
+    key = cfg.get("twiboost_api_key")
+    if key:
+        balance = TwiBoostApi.get_balance(key)
+        bal_txt = f"{balance[0]} {balance[1]}" if balance else "н/д"
+        status = f"✅ Подключён · Баланс: <b>{bal_txt}</b>"
+    else:
+        status = "❌ Не подключён"
+
+    services = load_services()
+    orders = load_orders()
+    await call.message.edit_text(
+        "🚀 <b>SMM</b>\n\n"
+        f"🔑 TwiBoost: {status}\n"
+        f"📦 Лотов: <b>{len(services)}</b>\n"
+        f"🧾 Заказов: <b>{len(orders)}</b>\n\n"
+        "Выберите раздел:",
+        reply_markup=admin_smm_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data == "adm_config")
 async def cb_adm_config(call: CallbackQuery):
     cfg = load_config()
@@ -831,26 +851,44 @@ async def adm_get_promo_amount(message: Message, state: FSMContext):
         reply_markup=admin_panel_kb(),
         parse_mode="HTML",
     )
+@router.callback_query(F.data == "adm_setkey")
 async def cb_adm_setkey(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminFlow.waiting_api_key)
-    await call.message.edit_text("Пришлите API-ключ TwiBoost (личный кабинет TwiBoost → API):")
+    await call.message.edit_text(
+        "🔑 <b>TwiBoost API</b>\n\n"
+        "Пришлите API-ключ TwiBoost (личный кабинет twiboost.com → API):",
+        reply_markup=back_kb("adm_smm", "❌ Отмена"),
+        parse_mode="HTML",
+    )
     await call.answer()
 
 
 @router.message(AdminFlow.waiting_api_key)
 async def adm_get_api_key(message: Message, state: FSMContext):
     key = (message.text or "").strip()
+    await state.clear()
+
+    wait_msg = await message.answer("⏳ Проверяю подключение к TwiBoost...")
+    balance = TwiBoostApi.get_balance(key)
+    await wait_msg.delete()
+
+    if balance is None:
+        await message.answer(
+            "❌ Неверный API-ключ или TwiBoost недоступен.\n"
+            "Проверьте ключ в профиле twiboost.com и попробуйте снова через 🚀 SMM → 🔑 TwiBoost API.",
+            reply_markup=admin_smm_kb(),
+        )
+        return
+
     cfg = load_config()
     cfg["twiboost_api_key"] = key
     save_config(cfg)
-    await state.clear()
 
-    balance = TwiBoostApi.get_balance(key)
-    if balance:
-        text = f"✅ Ключ сохранён. Баланс TwiBoost: {balance[0]} {balance[1]}"
-    else:
-        text = "⚠️ Ключ сохранён, но не удалось проверить баланс (проверьте ключ)."
-    await message.answer(text, reply_markup=admin_panel_kb())
+    await message.answer(
+        f"✅ TwiBoost подключён!\nБаланс: <b>{balance[0]} {balance[1]}</b>",
+        reply_markup=admin_smm_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "adm_services")
@@ -985,7 +1023,7 @@ async def cb_adm_orders(call: CallbackQuery):
                 f"{o['status']} · @{o.get('username') or o['user_id']}"
             )
         text = "\n".join(lines)
-    await call.message.edit_text(text, reply_markup=back_kb("adm_back", "⬅️ В админ-панель"), parse_mode="HTML")
+    await call.message.edit_text(text, reply_markup=back_kb("adm_smm", "⬅️ Назад в SMM"), parse_mode="HTML")
     await call.answer()
 
 
