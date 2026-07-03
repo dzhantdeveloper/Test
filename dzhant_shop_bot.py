@@ -53,6 +53,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SERVICES_PATH = os.path.join(BASE_DIR, "smm_services.json")
+CATEGORIES_PATH = os.path.join(BASE_DIR, "smm_categories.json")
 ORDERS_PATH = os.path.join(BASE_DIR, "smm_orders.json")
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")
 USERS_PATH = os.path.join(BASE_DIR, "users.json")
@@ -97,6 +98,24 @@ def load_services() -> dict:
 
 def save_services(data: dict) -> None:
     _save_json(SERVICES_PATH, data)
+
+
+def load_categories() -> list:
+    """Список категорий услуг (например Telegram, Youtube).
+    Это чисто пользовательская сущность для удобной навигации в боте —
+    на работу с TwiBoost никак не влияет."""
+    return _load_json(CATEGORIES_PATH, [])
+
+
+def save_categories(data: list) -> None:
+    _save_json(CATEGORIES_PATH, data)
+
+
+def add_category(name: str) -> None:
+    categories = load_categories()
+    if name not in categories:
+        categories.append(name)
+        save_categories(categories)
 
 
 def load_orders() -> list:
@@ -160,6 +179,20 @@ def add_balance(user_id: int, amount: float) -> float:
     return users[key]["balance"]
 
 
+def deduct_balance(user_id: int, amount: float) -> bool:
+    """Списывает сумму с баланса, если средств достаточно. Возвращает успех."""
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        users[key] = {"balance": 0.0, "promocodes_used": []}
+    current = float(users[key].get("balance", 0.0))
+    if current < amount:
+        return False
+    users[key]["balance"] = round(current - amount, 2)
+    save_users(users)
+    return True
+
+
 # ─────────────────────────────────────────────
 #  ПРОМОКОДЫ
 # ─────────────────────────────────────────────
@@ -180,12 +213,13 @@ def generate_promo_code(length: int = 8) -> str:
             return code
 
 
-def create_promocode(code: str, amount: float) -> None:
+def create_promocode(code: str, amount: float, max_activations: int = 1) -> None:
     promos = load_promocodes()
     promos[code] = {
         "amount": amount,
-        "used": False,
-        "used_by": None,
+        "max_activations": max_activations,
+        "activations_used": 0,
+        "used_by": [],
         "created_at": int(time.time()),
     }
     save_promocodes(promos)
@@ -197,11 +231,21 @@ def redeem_promocode(code: str, user_id: int):
     entry = promos.get(code)
     if not entry:
         return False, "Промокод не найден."
-    if entry.get("used"):
-        return False, "Этот промокод уже активирован."
 
-    entry["used"] = True
-    entry["used_by"] = user_id
+    # Совместимость со старым форматом промокодов (used: bool)
+    if "max_activations" not in entry:
+        entry["max_activations"] = 1
+        entry["activations_used"] = 1 if entry.get("used") else 0
+        entry["used_by"] = [entry["used_by"]] if entry.get("used_by") else []
+
+    if user_id in entry.get("used_by", []):
+        return False, "Вы уже активировали этот промокод."
+
+    if entry.get("activations_used", 0) >= entry.get("max_activations", 1):
+        return False, "У этого промокода закончились активации."
+
+    entry["activations_used"] = entry.get("activations_used", 0) + 1
+    entry.setdefault("used_by", []).append(user_id)
     entry["used_at"] = int(time.time())
     promos[code] = entry
     save_promocodes(promos)
@@ -266,12 +310,14 @@ class AdminAuth(StatesGroup):
 
 class AdminFlow(StatesGroup):
     waiting_api_key = State()
+    waiting_new_category_name = State()
     waiting_new_service_name = State()
     waiting_new_service_description = State()
     waiting_new_service_tbid = State()
     waiting_new_service_price = State()
     waiting_promo_custom_code = State()
     waiting_promo_amount = State()
+    waiting_promo_activations = State()
 
 
 class OrderFlow(StatesGroup):
@@ -288,27 +334,56 @@ class ProfileFlow(StatesGroup):
 # ─────────────────────────────────────────────
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton(text="🚀 SMM", callback_data="menu_services")],
+        [InlineKeyboardButton(text="🛠 Услуги", callback_data="menu_uslugi")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="ℹ️ О магазине", callback_data="menu_about")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def back_kb(callback_data="back_main", text="⬅️ Назад") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=callback_data)]])
+def uslugi_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(text="🚀 Накрутка", callback_data="uslugi_nakrutka")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def smm_services_kb() -> InlineKeyboardMarkup:
+def nakrutka_categories_kb() -> InlineKeyboardMarkup:
+    """Категории (сервисы вроде Telegram, Youtube) — показываем только те,
+    под которыми реально есть хотя бы один лот."""
+    services = load_services()
+    used_categories = {svc.get("category", "Без категории") for svc in services.values()}
+    categories = [c for c in load_categories() if c in used_categories]
+    # На случай, если у лота стоит категория, которой почему-то нет в списке категорий
+    for c in used_categories:
+        if c not in categories:
+            categories.append(c)
+
+    rows = [
+        [InlineKeyboardButton(text=cat, callback_data=f"nkcat_{cat}")]
+        for cat in categories
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_uslugi")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def nakrutka_services_kb(category: str) -> InlineKeyboardMarkup:
     services = load_services()
     rows = []
     for svc_id, svc in services.items():
+        if svc.get("category", "Без категории") != category:
+            continue
         rows.append([InlineKeyboardButton(
             text=f"{svc['name']} — {svc['price']} ₽/шт",
             callback_data=f"svc_{svc_id}",
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="uslugi_nakrutka")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def back_kb(callback_data="back_main", text="⬅️ Назад") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=callback_data)]])
 
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
@@ -316,6 +391,7 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
         [InlineKeyboardButton(text="🚀 SMM", callback_data="adm_smm")],
         [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_addpromo")],
+        [InlineKeyboardButton(text="🎫 Активные промокоды", callback_data="adm_active_promos")],
         [InlineKeyboardButton(text="⚙️ Конфиг", callback_data="adm_config")],
         [InlineKeyboardButton(text="🚪 Выход", callback_data="adm_exit")],
     ]
@@ -358,8 +434,9 @@ def admin_services_kb() -> InlineKeyboardMarkup:
     services = load_services()
     rows = []
     for svc_id, svc in services.items():
+        cat = svc.get("category", "Без категории")
         rows.append([
-            InlineKeyboardButton(text=f"{svc['name']}", callback_data=f"adm_svc_{svc_id}"),
+            InlineKeyboardButton(text=f"[{cat}] {svc['name']}", callback_data=f"adm_svc_{svc_id}"),
             InlineKeyboardButton(text="🗑", callback_data=f"adm_delsvc_{svc_id}"),
         ])
     rows.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm_addsvc")])
@@ -460,22 +537,43 @@ async def cb_about(call: CallbackQuery):
 # ─────────────────────────────────────────────
 #  SMM / НАКРУТКА (покупатель)
 # ─────────────────────────────────────────────
-@router.callback_query(F.data.in_(["menu_services", "smm_open"]))
-async def cb_smm_open(call: CallbackQuery):
+@router.callback_query(F.data == "menu_uslugi")
+async def cb_menu_uslugi(call: CallbackQuery):
+    await call.message.edit_text(
+        "🛠 <b>Услуги</b>\n\nВыберите раздел:",
+        reply_markup=uslugi_menu_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "uslugi_nakrutka")
+async def cb_uslugi_nakrutka(call: CallbackQuery):
     services = load_services()
     if not services:
         await call.message.edit_text(
-            "🧾 <b>Лоты</b>\n\n"
+            "🚀 <b>Накрутка</b>\n\n"
             "Пока нет ни одного активного предложения. Загляните позже.",
-            reply_markup=back_kb("back_main"),
+            reply_markup=back_kb("menu_uslugi"),
             parse_mode="HTML",
         )
     else:
         await call.message.edit_text(
-            "🧾 <b>Лоты</b>\n\nАктивные предложения:",
-            reply_markup=smm_services_kb(),
+            "🚀 <b>Накрутка</b>\n\nВыберите сервис:",
+            reply_markup=nakrutka_categories_kb(),
             parse_mode="HTML",
         )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("nkcat_"))
+async def cb_nakrutka_category(call: CallbackQuery):
+    category = call.data.removeprefix("nkcat_")
+    await call.message.edit_text(
+        f"🚀 <b>Накрутка — {category}</b>\n\nВыберите услугу:",
+        reply_markup=nakrutka_services_kb(category),
+        parse_mode="HTML",
+    )
     await call.answer()
 
 
@@ -491,7 +589,7 @@ async def cb_service_info(call: CallbackQuery, state: FSMContext):
     await state.update_data(svc_id=svc_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Заказать", callback_data=f"order_{svc_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="smm_open")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="uslugi_nakrutka")],
     ])
     description = svc.get("description") or "—"
     await call.message.edit_text(
@@ -568,6 +666,7 @@ async def order_get_link(message: Message, state: FSMContext):
     total = round(qty * svc["price"], 2)
     await state.update_data(link=link)
 
+    balance = get_balance(message.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="confirm_order")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="back_main")],
@@ -578,6 +677,8 @@ async def order_get_link(message: Message, state: FSMContext):
         f"Количество: {qty}\n"
         f"Ссылка: {link}\n"
         f"Итого: <b>{total} ₽</b>\n\n"
+        f"💳 С баланса спишется: <b>{total} ₽</b>\n"
+        f"💰 Текущий баланс: <b>{balance} ₽</b>\n\n"
         "Подтвердите оформление:",
         reply_markup=kb,
         parse_mode="HTML",
@@ -600,12 +701,35 @@ async def cb_confirm_order(call: CallbackQuery, state: FSMContext):
 
     qty = data["quantity"]
     link = data["link"]
+    total = round(qty * svc["price"], 2)
+
+    if get_balance(call.from_user.id) < total:
+        await call.message.edit_text(
+            f"❌ Недостаточно средств на балансе.\n"
+            f"Нужно: <b>{total} ₽</b>, доступно: <b>{get_balance(call.from_user.id)} ₽</b>.\n"
+            "Пополните баланс промокодом в разделе «Профиль».",
+            reply_markup=back_kb(),
+            parse_mode="HTML",
+        )
+        await state.clear()
+        await call.answer()
+        return
 
     result = TwiBoostApi.add_order(api_key, svc["tb_id"], link, qty)
     if not result or "order" not in result:
         error_text = result.get("error") if isinstance(result, dict) else "неизвестная ошибка"
         await call.message.edit_text(
             f"❌ Не удалось создать заказ в TwiBoost.\nОшибка: {error_text}\n\nСредства не списывались.",
+            reply_markup=back_kb(),
+        )
+        await state.clear()
+        await call.answer()
+        return
+
+    # Списываем средства только после успешного создания заказа в TwiBoost
+    if not deduct_balance(call.from_user.id, total):
+        await call.message.edit_text(
+            "❌ Недостаточно средств на балансе. Заказ отменён.",
             reply_markup=back_kb(),
         )
         await state.clear()
@@ -629,11 +753,14 @@ async def cb_confirm_order(call: CallbackQuery, state: FSMContext):
     save_orders(orders)
     await state.clear()
 
+    new_balance = get_balance(call.from_user.id)
     await call.message.edit_text(
         f"✅ <b>Заказ #{local_id} оформлен!</b>\n\n"
         f"Услуга: {svc['name']}\n"
         f"Количество: {qty}\n"
         f"Статус: обрабатывается\n\n"
+        f"💳 Списано с баланса: <b>{total} ₽</b>\n"
+        f"💰 Остаток на балансе: <b>{new_balance} ₽</b>\n\n"
         "Мы уведомим вас, когда заказ будет выполнен.",
         reply_markup=back_kb(),
         parse_mode="HTML",
@@ -789,6 +916,32 @@ async def cb_adm_addpromo(call: CallbackQuery):
     await call.answer()
 
 
+@router.callback_query(F.data == "adm_active_promos")
+async def cb_adm_active_promos(call: CallbackQuery):
+    promos = load_promocodes()
+    lines = ["🎫 <b>Активные промокоды</b>\n"]
+    active = []
+    for code, entry in promos.items():
+        max_act = entry.get("max_activations", 1)
+        used_act = entry.get("activations_used", 1 if entry.get("used") else 0)
+        if used_act < max_act:
+            active.append((code, entry, used_act, max_act))
+
+    if not active:
+        lines.append("Нет ни одного действующего промокода.")
+    else:
+        for code, entry, used_act, max_act in active:
+            lines.append(
+                f"<code>{code}</code> — {entry['amount']} ₽ · использован {used_act}/{max_act}"
+            )
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=back_kb("adm_back", "⬅️ В админ-панель"),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data == "adm_promo_gen")
 async def cb_adm_promo_gen(call: CallbackQuery, state: FSMContext):
     code = generate_promo_code()
@@ -839,15 +992,32 @@ async def adm_get_promo_amount(message: Message, state: FSMContext):
         await message.answer("Нужно положительное число, например 100. Введите сумму:")
         return
 
+    await state.update_data(promo_amount=amount)
+    await state.set_state(AdminFlow.waiting_promo_activations)
+    await message.answer(
+        "Сколько раз можно активировать этот промокод (разными пользователями)?\n"
+        "Введите число, например 1 или 10:"
+    )
+
+
+@router.message(AdminFlow.waiting_promo_activations)
+async def adm_get_promo_activations(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        await message.answer("Нужно положительное целое число. Введите количество активаций:")
+        return
+
+    max_activations = int(message.text.strip())
     data = await state.get_data()
     code = data.get("promo_code")
+    amount = data.get("promo_amount")
     await state.clear()
 
-    create_promocode(code, amount)
+    create_promocode(code, amount, max_activations)
     await message.answer(
         f"✅ Промокод создан!\n\n"
         f"Код: <code>{code}</code>\n"
-        f"Сумма: <b>{amount} ₽</b>",
+        f"Сумма: <b>{amount} ₽</b>\n"
+        f"Активаций: <b>{max_activations}</b>",
         reply_markup=admin_panel_kb(),
         parse_mode="HTML",
     )
@@ -915,18 +1085,79 @@ async def cb_adm_delsvc(call: CallbackQuery):
     await call.answer()
 
 
+def category_choice_kb() -> InlineKeyboardMarkup:
+    categories = load_categories()
+    rows = [
+        [InlineKeyboardButton(text=cat, callback_data=f"adm_cat_choose_{cat}")]
+        for cat in categories
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Новый сервис", callback_data="adm_cat_new")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в SMM", callback_data="adm_smm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data == "adm_addsvc")
 async def cb_adm_addsvc(call: CallbackQuery, state: FSMContext):
     cfg = load_config()
     if not cfg.get("twiboost_api_key"):
         await call.answer("Сначала задайте TwiBoost API ключ.", show_alert=True)
         return
+
+    categories = load_categories()
+    if not categories:
+        # Ещё нет ни одного сервиса (категории) — просим создать первый
+        await state.set_state(AdminFlow.waiting_new_category_name)
+        await call.message.edit_text(
+            "➕ <b>Новый лот</b>\n\n"
+            "Пока нет ни одного сервиса. Напишите название сервиса "
+            "(например Telegram, YouTube и т.д.):",
+            parse_mode="HTML",
+        )
+    else:
+        await call.message.edit_text(
+            "➕ <b>Новый лот</b>\n\n"
+            "Выберите сервис, к которому относится лот, или создайте новый:",
+            reply_markup=category_choice_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_cat_new")
+async def cb_adm_cat_new(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.waiting_new_category_name)
+    await call.message.edit_text(
+        "✏️ Напишите название нового сервиса (например Telegram, YouTube и т.д.):",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cat_choose_"))
+async def cb_adm_cat_choose(call: CallbackQuery, state: FSMContext):
+    category = call.data.removeprefix("adm_cat_choose_")
+    await state.update_data(category=category)
     await state.set_state(AdminFlow.waiting_new_service_name)
     await call.message.edit_text(
-        "➕ <b>Новый лот</b>\n\nВведите название, которое увидят покупатели:",
+        f"➕ <b>Новый лот · {category}</b>\n\nВведите название, которое увидят покупатели:",
         parse_mode="HTML",
     )
     await call.answer()
+
+
+@router.message(AdminFlow.waiting_new_category_name)
+async def adm_get_category_name(message: Message, state: FSMContext):
+    category = (message.text or "").strip()
+    if not category:
+        await message.answer("Название не может быть пустым. Напишите название сервиса:")
+        return
+
+    add_category(category)
+    await state.update_data(category=category)
+    await state.set_state(AdminFlow.waiting_new_service_name)
+    await message.answer(
+        f"✅ Сервис «{category}» добавлен.\n\n"
+        "Теперь введите название лота, которое увидят покупатели:"
+    )
 
 
 @router.message(AdminFlow.waiting_new_service_name)
@@ -1003,10 +1234,14 @@ async def adm_get_svc_price(message: Message, state: FSMContext):
         "price": price,
         "min": data["tb_min"],
         "max": data["tb_max"],
+        "category": data.get("category", "Без категории"),
     }
     save_services(services)
     await state.clear()
-    await message.answer(f"✅ Лот «{data['name']}» добавлен.", reply_markup=admin_panel_kb())
+    await message.answer(
+        f"✅ Лот «{data['name']}» добавлен в сервис «{data.get('category', 'Без категории')}».",
+        reply_markup=admin_panel_kb(),
+    )
 
 
 @router.callback_query(F.data == "adm_orders")
