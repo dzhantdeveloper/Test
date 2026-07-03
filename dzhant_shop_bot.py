@@ -20,10 +20,10 @@ def ensure_dependencies():
         if importlib.util.find_spec(module_name) is None:
             missing.append(pip_spec)
     if missing:
-        print("Устанавливаю недостающие зависимости:", ", ".join(missing))
+        print("Устанавливаю недостающие зависимости:", ", ".join(missing), flush=True)
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
         subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-        print("Зависимости установлены.\n")
+        print("Зависимости установлены.\n", flush=True)
 
 
 ensure_dependencies()
@@ -1027,24 +1027,55 @@ async def order_status_checker(bot: Bot):
 
 
 # ─────────────────────────────────────────────
+#  FALLBACK: НЕРАСПОЗНАННЫЕ СООБЩЕНИЯ И КНОПКИ
+#  Должны быть зарегистрированы ПОСЛЕДНИМИ — иначе перехватят
+#  апдейты раньше нужных хендлеров.
+# ─────────────────────────────────────────────
+@router.callback_query()
+async def fallback_callback(call: CallbackQuery, state: FSMContext):
+    # Нажата кнопка от устаревшей/неизвестной клавиатуры — не оставляем
+    # пользователя в подвисшем состоянии, а возвращаем в главное меню.
+    await state.clear()
+    try:
+        await call.message.edit_text(
+            f"<b>{SHOP_NAME}</b> — главное меню:",
+            reply_markup=main_menu_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer("Кнопка устарела, открыл главное меню", show_alert=False)
+
+
+@router.message()
+async def fallback_message(message: Message, state: FSMContext):
+    # Любое сообщение, не попавшее ни под одну команду или активное состояние.
+    await state.clear()
+    await message.answer(
+        "Не понял команду 🤔\nНажмите /start, чтобы открыть меню.",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ─────────────────────────────────────────────
 #  ПЕРВЫЙ ЗАПУСК / MAIN
 # ─────────────────────────────────────────────
 def first_run_setup() -> dict:
-    print("=== Первый запуск Dzhant Shop Bot ===")
-    print("Настройка выполняется один раз, данные сохранятся в config.json\n")
+    print("=== Первый запуск Dzhant Shop Bot ===", flush=True)
+    print("Настройка выполняется один раз, данные сохранятся в config.json\n", flush=True)
 
     token = input("Введите TOKEN Telegram-бота (получить у @BotFather): ").strip()
     while not token:
         token = input("Токен не может быть пустым. Введите TOKEN: ").strip()
 
-    print("\nТеперь задайте пароль для админ-панели (команда /panel).")
-    print("Пароль не отображается на экране при вводе.")
+    print("\nТеперь задайте пароль для админ-панели (команда /panel).", flush=True)
+    print("Пароль не отображается на экране при вводе.", flush=True)
     while True:
         password = getpass.getpass("Придумайте пароль администратора: ")
         password_confirm = getpass.getpass("Повторите пароль: ")
         if password and password == password_confirm:
             break
-        print("Пароли не совпадают или пустые. Попробуйте снова.")
+        print("Пароли не совпадают или пустые. Попробуйте снова.", flush=True)
 
     admin_id_raw = input(
         "\n(Необязательно) Ваш Telegram numeric ID для автодоступа к /panel без пароля "
@@ -1058,8 +1089,8 @@ def first_run_setup() -> dict:
         "panel_locked": False,
     }
     save_config(cfg)
-    print("\nНастройка завершена. Конфигурация сохранена в config.json")
-    print("Запускаю бота...\n")
+    print("\nНастройка завершена. Конфигурация сохранена в config.json", flush=True)
+    print("Запускаю бота...\n", flush=True)
     return cfg
 
 
