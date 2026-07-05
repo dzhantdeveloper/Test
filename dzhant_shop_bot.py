@@ -19,11 +19,24 @@ def ensure_dependencies():
     for module_name, pip_spec in required.items():
         if importlib.util.find_spec(module_name) is None:
             missing.append(pip_spec)
-    if missing:
-        print("Устанавливаю недостающие зависимости:", ", ".join(missing), flush=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-        print("Зависимости установлены.\n", flush=True)
+    if not missing:
+        return
+
+    print("Устанавливаю недостающие зависимости:", ", ".join(missing), flush=True)
+    pip_install = [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]
+    try:
+        subprocess.check_call(pip_install, stdout=subprocess.DEVNULL)
+    except Exception:
+        pass  # апгрейд pip не критичен, продолжаем
+
+    install_cmd = [sys.executable, "-m", "pip", "install", *missing]
+    try:
+        subprocess.check_call(install_cmd)
+    except subprocess.CalledProcessError:
+        # Свежие Debian/Ubuntu (PEP 668) блокируют системный pip —
+        # ставим с флагом --break-system-packages как запасной вариант.
+        subprocess.check_call([*install_cmd, "--break-system-packages"])
+    print("Зависимости установлены.\n", flush=True)
 
 
 ensure_dependencies()
@@ -46,7 +59,10 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery,
+)
 
 # ─────────────────────────────────────────────
 #  ПУТИ / КОНСТАНТЫ
@@ -571,6 +587,7 @@ class AdminFlow(StatesGroup):
     waiting_gc_name = State()
     waiting_gc_price = State()
     waiting_gc_key = State()
+    waiting_stars_rate = State()
 
 
 class OrderFlow(StatesGroup):
@@ -673,12 +690,19 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 def admin_payments_kb() -> InlineKeyboardMarkup:
     cfg = load_config()
     has_token = bool(cfg.get("cryptobot_token"))
-    enabled = cfg.get("cryptobot_enabled", False)
+    cb_enabled = cfg.get("cryptobot_enabled", False)
     token_status = "✅ подключён" if has_token else "❌ не подключён"
-    toggle_text = "🔴 Выключить" if enabled else "🟢 Включить"
+    cb_toggle_text = "🔴 Выключить" if cb_enabled else "🟢 Включить"
+
+    stars_enabled = cfg.get("stars_enabled", False)
+    stars_toggle_text = "🔴 Выключить Stars" if stars_enabled else "🟢 Включить Stars"
+    stars_rate = cfg.get("stars_rate", 1.5)
+
     buttons = [InlineKeyboardButton(text=f"🔑 CryptoBot ({token_status})", callback_data="adm_cryptobot_setkey")]
     if has_token:
-        buttons.append(InlineKeyboardButton(text=toggle_text, callback_data="adm_cryptobot_toggle"))
+        buttons.append(InlineKeyboardButton(text=cb_toggle_text, callback_data="adm_cryptobot_toggle"))
+    buttons.append(InlineKeyboardButton(text=stars_toggle_text, callback_data="adm_stars_toggle"))
+    buttons.append(InlineKeyboardButton(text=f"⭐ Курс: {stars_rate} ₽", callback_data="adm_stars_setrate"))
     kb = pair_rows(buttons)
     kb.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="adm_back")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -778,7 +802,7 @@ async def cb_profile(call: CallbackQuery):
     balance = get_balance(user.id)
     cfg = load_config()
     buttons = []
-    if cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled"):
+    if (cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled")) or cfg.get("stars_enabled"):
         buttons.append(InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="profile_topup"))
     buttons.append(InlineKeyboardButton(text="🎟 Промокод", callback_data="profile_promo"))
     buttons.append(InlineKeyboardButton(text="📋 Мои заказы", callback_data="profile_orders"))
@@ -895,15 +919,82 @@ async def profile_get_promo_code(message: Message, state: FSMContext):
     )
 
 
+def topup_methods_kb(cfg: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    if cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled"):
+        buttons.append(InlineKeyboardButton(text="💎 CryptoBot", callback_data="topup_method_cryptobot"))
+    if cfg.get("stars_enabled"):
+        buttons.append(InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="topup_method_stars"))
+    rows = [[b] for b in buttons]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_profile")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data == "profile_topup")
 async def cb_profile_topup(call: CallbackQuery, state: FSMContext):
     cfg = load_config()
-    if not (cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled")):
+    has_cryptobot = bool(cfg.get("cryptobot_token") and cfg.get("cryptobot_enabled"))
+    has_stars = bool(cfg.get("stars_enabled"))
+
+    if not has_cryptobot and not has_stars:
         await call.answer("Пополнение баланса временно недоступно.", show_alert=True)
         return
+
+    if has_cryptobot and not has_stars:
+        await state.update_data(topup_method="cryptobot")
+        await state.set_state(ProfileFlow.waiting_topup_amount)
+        await call.message.edit_text(
+            "💰 <b>Пополнение баланса через CryptoBot</b>\n\nВведите сумму пополнения в рублях (например 500):",
+            reply_markup=back_kb("menu_profile", "❌ Отмена"),
+            parse_mode="HTML",
+        )
+        await call.answer()
+        return
+
+    if has_stars and not has_cryptobot:
+        await state.update_data(topup_method="stars")
+        await state.set_state(ProfileFlow.waiting_topup_amount)
+        rate = cfg.get("stars_rate", 1.5)
+        await call.message.edit_text(
+            f"💰 <b>Пополнение баланса через ⭐ Telegram Stars</b>\n\n"
+            f"Курс: 1 ⭐ = {rate} ₽\n\n"
+            "Сколько звёзд списать? Введите число (например 100):",
+            reply_markup=back_kb("menu_profile", "❌ Отмена"),
+            parse_mode="HTML",
+        )
+        await call.answer()
+        return
+
+    await call.message.edit_text(
+        "💰 <b>Пополнение баланса</b>\n\nВыберите способ оплаты:",
+        reply_markup=topup_methods_kb(cfg),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "topup_method_cryptobot")
+async def cb_topup_method_cryptobot(call: CallbackQuery, state: FSMContext):
+    await state.update_data(topup_method="cryptobot")
     await state.set_state(ProfileFlow.waiting_topup_amount)
     await call.message.edit_text(
-        "💰 <b>Пополнение баланса</b>\n\nВведите сумму пополнения в рублях (например 500):",
+        "💰 <b>Пополнение баланса через CryptoBot</b>\n\nВведите сумму пополнения в рублях (например 500):",
+        reply_markup=back_kb("menu_profile", "❌ Отмена"),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "topup_method_stars")
+async def cb_topup_method_stars(call: CallbackQuery, state: FSMContext):
+    cfg = load_config()
+    rate = cfg.get("stars_rate", 1.5)
+    await state.update_data(topup_method="stars")
+    await state.set_state(ProfileFlow.waiting_topup_amount)
+    await call.message.edit_text(
+        f"💰 <b>Пополнение баланса через ⭐ Telegram Stars</b>\n\n"
+        f"Курс: 1 ⭐ = {rate} ₽\n\n"
+        "Сколько звёзд списать? Введите число (например 100):",
         reply_markup=back_kb("menu_profile", "❌ Отмена"),
         parse_mode="HTML",
     )
@@ -912,16 +1003,43 @@ async def cb_profile_topup(call: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileFlow.waiting_topup_amount)
 async def profile_get_topup_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    method = data.get("topup_method", "cryptobot")
+
     try:
         amount = float((message.text or "").replace(",", "."))
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Нужно положительное число, например 500. Введите сумму:")
+        unit = "звёзд" if method == "stars" else "рублей"
+        await message.answer(f"Нужно положительное число {unit}, например 500. Введите сумму:")
         return
 
     await state.clear()
     cfg = load_config()
+
+    if method == "stars":
+        if not cfg.get("stars_enabled"):
+            await message.answer("Пополнение через Stars временно недоступно.", reply_markup=back_kb("menu_profile"))
+            return
+        stars = int(amount)
+        rate = cfg.get("stars_rate", 1.5)
+        rub_equivalent = round(stars * rate, 2)
+        prices = [LabeledPrice(label=f"Пополнение баланса на {rub_equivalent} ₽", amount=stars)]
+        try:
+            await message.answer_invoice(
+                title="Пополнение баланса",
+                description=f"{stars} ⭐ = {rub_equivalent} ₽ на баланс {SHOP_NAME}",
+                payload=f"topup_stars:{message.from_user.id}:{int(time.time())}",
+                provider_token="",
+                currency="XTR",
+                prices=prices,
+            )
+        except Exception as ex:
+            logger.error(f"Ошибка при выставлении счёта Stars: {ex}")
+            await message.answer("❌ Не удалось выставить счёт. Попробуйте позже.", reply_markup=back_kb("menu_profile"))
+        return
+
     token = cfg.get("cryptobot_token")
     if not (token and cfg.get("cryptobot_enabled")):
         await message.answer("Пополнение баланса временно недоступно.", reply_markup=back_kb("menu_profile"))
@@ -988,6 +1106,33 @@ async def cb_topup_check(call: CallbackQuery):
         await call.answer()
     else:
         await call.answer("Оплата ещё не поступила. Попробуйте немного позже.", show_alert=True)
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    await pre_checkout_q.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payment = message.successful_payment
+    if payment.currency != "XTR":
+        return  # платежи с другой валютой сюда пока не приходят, но на всякий случай
+
+    stars = payment.total_amount
+    cfg = load_config()
+    rate = cfg.get("stars_rate", 1.5)
+    amount_rub = round(stars * rate, 2)
+    new_balance = add_balance(message.from_user.id, amount_rub)
+
+    await message.answer(
+        f"✅ Оплата через Stars получена!\n"
+        f"⭐ Списано: {stars}\n"
+        f"💳 Зачислено: <b>{fmt_price(amount_rub, message.from_user.id)}</b>\n"
+        f"💰 Текущий баланс: <b>{fmt_price(new_balance, message.from_user.id)}</b>",
+        reply_markup=back_kb("menu_profile"),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "menu_about")
@@ -1116,7 +1261,7 @@ async def cb_gc_lot_info(call: CallbackQuery):
     stock = len(gc.get("keys", []))
     kb_rows = []
     if stock > 0:
-        kb_rows.append([InlineKeyboardButton(text="🛒 Купить", callback_data=f"gcbuy_{gc_id}")])
+        kb_rows.append([InlineKeyboardButton(text="🛒 Купить", callback_data=f"gcconfirm_{gc_id}")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"gccat_{gc['category']}")])
 
     await call.message.edit_text(
@@ -1126,6 +1271,33 @@ async def cb_gc_lot_info(call: CallbackQuery):
         f"📦 В наличии: <b>{stock} шт</b>\n\n"
         + ("Нажмите «Купить», чтобы получить ключ." if stock > 0 else "⚠️ Сейчас нет в наличии."),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("gcconfirm_"))
+async def cb_gc_confirm(call: CallbackQuery):
+    gc_id = call.data.removeprefix("gcconfirm_")
+    giftcards = load_giftcards()
+    gc = giftcards.get(gc_id)
+    if not gc or not gc.get("keys"):
+        await call.answer("Карта закончилась или недоступна.", show_alert=True)
+        return
+
+    price = gc["price"]
+    balance = get_balance(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"gcbuy_{gc_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gclot_{gc_id}")],
+    ])
+    await call.message.edit_text(
+        f"📋 <b>Подтверждение покупки</b>\n\n"
+        f"Товар: {gc['name']} ({gc['country']})\n"
+        f"💳 С баланса спишется: <b>{fmt_price(price, call.from_user.id)}</b>\n"
+        f"💰 Текущий баланс: <b>{fmt_price(balance, call.from_user.id)}</b>\n\n"
+        "Подтвердите покупку:",
+        reply_markup=kb,
         parse_mode="HTML",
     )
     await call.answer()
@@ -1495,17 +1667,22 @@ async def cb_adm_uslugi(call: CallbackQuery):
 async def cb_adm_payments(call: CallbackQuery):
     cfg = load_config()
     has_token = bool(cfg.get("cryptobot_token"))
-    enabled = cfg.get("cryptobot_enabled", False)
-    if has_token and enabled:
-        status = "✅ CryptoBot подключён и включён"
-    elif has_token and not enabled:
-        status = "⏸ CryptoBot подключён, но выключен"
+    cb_enabled = cfg.get("cryptobot_enabled", False)
+    if has_token and cb_enabled:
+        cb_status = "✅ CryptoBot подключён и включён"
+    elif has_token and not cb_enabled:
+        cb_status = "⏸ CryptoBot подключён, но выключен"
     else:
-        status = "❌ CryptoBot не подключён"
+        cb_status = "❌ CryptoBot не подключён"
+
+    stars_status = "✅ Telegram Stars включены" if cfg.get("stars_enabled") else "⏸ Telegram Stars выключены"
+
     await call.message.edit_text(
-        f"💳 <b>Способы оплаты</b>\n\n{status}\n\n"
+        f"💳 <b>Способы оплаты</b>\n\n{cb_status}\n{stars_status}\n\n"
         "CryptoBot — приём оплаты через криптовалюту (@CryptoBot в Telegram). "
-        "Получите API-токен: @CryptoBot → Crypto Pay → Create App.",
+        "Получите API-токен: @CryptoBot → Crypto Pay → Create App.\n\n"
+        "Telegram Stars — оплата встроенной валютой Telegram, доп. настройка не нужна, "
+        "только курс перевода в рубли.",
         reply_markup=admin_payments_kb(),
         parse_mode="HTML",
     )
@@ -1570,6 +1747,51 @@ async def cb_adm_cryptobot_toggle(call: CallbackQuery):
         parse_mode="HTML",
     )
     await call.answer("Оплата включена" if enabled else "Оплата выключена")
+
+
+@router.callback_query(F.data == "adm_stars_toggle")
+async def cb_adm_stars_toggle(call: CallbackQuery):
+    cfg = load_config()
+    cfg["stars_enabled"] = not cfg.get("stars_enabled", False)
+    cfg.setdefault("stars_rate", 1.5)
+    save_config(cfg)
+    enabled = cfg["stars_enabled"]
+    status = "✅ Telegram Stars включены" if enabled else "⏸ Telegram Stars выключены"
+    await call.message.edit_text(
+        f"💳 <b>Способы оплаты</b>\n\n{status}",
+        reply_markup=admin_payments_kb(),
+        parse_mode="HTML",
+    )
+    await call.answer("Stars включены" if enabled else "Stars выключены")
+
+
+@router.callback_query(F.data == "adm_stars_setrate")
+async def cb_adm_stars_setrate(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.waiting_stars_rate)
+    await call.message.edit_text(
+        "⭐ Введите курс — сколько рублей стоит 1 звезда (например 1.5):",
+        reply_markup=back_kb("adm_payments", "❌ Отмена"),
+    )
+    await call.answer()
+
+
+@router.message(AdminFlow.waiting_stars_rate)
+async def adm_get_stars_rate(message: Message, state: FSMContext):
+    try:
+        rate = float((message.text or "").replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно положительное число, например 1.5. Введите курс:")
+        return
+    cfg = load_config()
+    cfg["stars_rate"] = rate
+    save_config(cfg)
+    await state.clear()
+    await message.answer(
+        f"✅ Курс обновлён: 1 ⭐ = {rate} ₽",
+        reply_markup=admin_payments_kb(),
+    )
 
 
 @router.callback_query(F.data == "adm_config")
@@ -2041,7 +2263,7 @@ def admin_gc_lot_detail_kb(gc_id: str, category: str) -> InlineKeyboardMarkup:
     kb = [
         [
             InlineKeyboardButton(text="➕ Добавить ключ", callback_data=f"adm_gc_addkey_{gc_id}"),
-            InlineKeyboardButton(text="📦 Склад", callback_data=f"adm_gc_stock_{gc_id}"),
+            InlineKeyboardButton(text="📦 Склад", callback_data=f"adm_gc_stock_{gc_id}_0"),
         ],
         [InlineKeyboardButton(text="🗑 Удалить лот", callback_data=f"adm_gc_dellot_{gc_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_gc_cat_{category}")],
@@ -2243,29 +2465,106 @@ async def adm_get_gc_key(message: Message, state: FSMContext):
     )
 
 
+GC_STOCK_PAGE_SIZE = 10
+
+
+def admin_gc_stock_kb(gc_id: str, keys: list, offset: int) -> InlineKeyboardMarkup:
+    rows = []
+    page_keys = keys[offset:offset + GC_STOCK_PAGE_SIZE]
+    for i, key in enumerate(page_keys):
+        idx = offset + i
+        label = key if len(key) <= 28 else key[:25] + "…"
+        rows.append([InlineKeyboardButton(text=f"🗑 {label}", callback_data=f"adm_gc_delkey_{gc_id}_{idx}")])
+
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️ Пред.", callback_data=f"adm_gc_stock_{gc_id}_{max(0, offset - GC_STOCK_PAGE_SIZE)}"
+        ))
+    if offset + GC_STOCK_PAGE_SIZE < len(keys):
+        nav.append(InlineKeyboardButton(
+            text="След. ➡️", callback_data=f"adm_gc_stock_{gc_id}_{offset + GC_STOCK_PAGE_SIZE}"
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к лоту", callback_data=f"adm_gclot_{gc_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data.startswith("adm_gc_stock_"))
 async def cb_adm_gc_stock(call: CallbackQuery):
-    gc_id = call.data.removeprefix("adm_gc_stock_")
+    payload = call.data.removeprefix("adm_gc_stock_")
+    gc_id, _, offset_str = payload.rpartition("_")
+    offset = int(offset_str) if offset_str.isdigit() else 0
+
     giftcards = load_giftcards()
     gc = giftcards.get(gc_id)
     if not gc:
         await call.answer("Лот не найден.", show_alert=True)
         return
+
     keys = gc.get("keys", [])
     if not keys:
         text = f"📦 <b>Склад · {gc['name']}</b>\n\nКлючей нет."
     else:
-        shown = keys[:50]
-        lines = "\n".join(f"<code>{k}</code>" for k in shown)
-        text = f"📦 <b>Склад · {gc['name']}</b>\n\nВсего: {len(keys)} шт\n\n{lines}"
-        if len(keys) > 50:
-            text += f"\n\n… и ещё {len(keys) - 50} шт"
+        total_pages = (len(keys) - 1) // GC_STOCK_PAGE_SIZE + 1
+        current_page = offset // GC_STOCK_PAGE_SIZE + 1
+        text = (
+            f"📦 <b>Склад · {gc['name']}</b>\n\n"
+            f"Всего: {len(keys)} шт · страница {current_page}/{total_pages}\n"
+            "Нажмите на ключ, чтобы удалить его со склада."
+        )
+
     await call.message.edit_text(
         text,
-        reply_markup=back_kb(f"adm_gclot_{gc_id}", "⬅️ Назад"),
+        reply_markup=admin_gc_stock_kb(gc_id, keys, offset),
         parse_mode="HTML",
     )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_gc_delkey_"))
+async def cb_adm_gc_delkey(call: CallbackQuery):
+    payload = call.data.removeprefix("adm_gc_delkey_")
+    gc_id, _, idx_str = payload.rpartition("_")
+    idx = int(idx_str) if idx_str.isdigit() else -1
+
+    giftcards = load_giftcards()
+    gc = giftcards.get(gc_id)
+    if not gc:
+        await call.answer("Лот не найден.", show_alert=True)
+        return
+
+    keys = gc.get("keys", [])
+    if 0 <= idx < len(keys):
+        removed = keys.pop(idx)
+        save_giftcards(giftcards)
+        await call.answer(f"Ключ удалён со склада ({len(keys)} шт осталось)")
+    else:
+        await call.answer("Этот ключ уже удалён.", show_alert=True)
+
+    # Показываем ту же страницу заново (если она опустела — соседнюю)
+    offset = (idx // GC_STOCK_PAGE_SIZE) * GC_STOCK_PAGE_SIZE
+    if offset >= len(keys) and offset > 0:
+        offset -= GC_STOCK_PAGE_SIZE
+
+    if not keys:
+        text = f"📦 <b>Склад · {gc['name']}</b>\n\nКлючей нет."
+    else:
+        total_pages = (len(keys) - 1) // GC_STOCK_PAGE_SIZE + 1
+        current_page = offset // GC_STOCK_PAGE_SIZE + 1
+        text = (
+            f"📦 <b>Склад · {gc['name']}</b>\n\n"
+            f"Всего: {len(keys)} шт · страница {current_page}/{total_pages}\n"
+            "Нажмите на ключ, чтобы удалить его со склада."
+        )
+
+    await call.message.edit_text(
+        text,
+        reply_markup=admin_gc_stock_kb(gc_id, keys, offset),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("adm_gc_dellot_"))
@@ -2498,30 +2797,25 @@ def print_manual_background_instructions() -> None:
 
 
 def offer_background_install() -> None:
-    """Предлагает установить бота как фоновый systemd-сервис сразу после
-    первичной настройки, чтобы консоль можно было закрыть."""
+    """Сразу после первичной настройки переводит бота в фоновый режим —
+    без лишних вопросов, по аналогии с FunPay Cardinal: настроил и забыл,
+    консоль можно закрывать."""
     print(
-        "\nЧтобы бот работал постоянно и не зависел от открытой консоли/SSH,\n"
-        "его можно запустить как фоновый systemd-сервис — он переживёт\n"
-        "закрытие консоли и перезапуск сервера.\n",
+        "\nПеревожу бота в фоновый режим, чтобы он не зависел от открытой консоли/SSH...\n",
         flush=True,
     )
-    answer = input("Установить как фоновый сервис прямо сейчас? (y/n): ").strip().lower()
-    if answer not in ("y", "yes", "д", "да"):
-        print_manual_background_instructions()
-        return
 
     if not systemd_available():
         print(
-            "\n⚠️ Автоустановка сервиса недоступна: нужен Linux-сервер и запуск "
-            "от root (sudo python3 dzhant_shop_bot.py).",
+            "⚠️ Автоматический фоновый режим доступен только на Linux-сервере "
+            "при запуске от root (sudo python3 dzhant_shop_bot.py).",
             flush=True,
         )
         print_manual_background_instructions()
         return
 
     if install_systemd_service():
-        print(f"\n✅ Сервис «{SERVICE_NAME}» установлен и запущен в фоне.", flush=True)
+        print(f"✅ Сервис «{SERVICE_NAME}» установлен и запущен в фоне.", flush=True)
         print("Полезные команды:", flush=True)
         print(f"  systemctl status {SERVICE_NAME}    — статус", flush=True)
         print(f"  systemctl restart {SERVICE_NAME}   — перезапуск", flush=True)
